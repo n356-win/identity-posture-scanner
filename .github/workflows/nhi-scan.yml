@@ -1,0 +1,77 @@
+name: NHI scan
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'        # Mondays 06:00 UTC
+  workflow_dispatch:            # keep this — you need to run it by hand while building
+
+permissions:
+  id-token: write               # REQUIRED. Without it, step 2 above never happens.
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    environment: lab            # optional, but see "pin the subject" below
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Exchange GitHub OIDC token for a Graph token
+        id: token
+        shell: pwsh
+        run: |
+          # 1. Ask GitHub for an OIDC token, audience = Entra's exchange audience.
+          $ghToken = (Invoke-RestMethod `
+              -Uri "$env:ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" `
+              -Headers @{ Authorization = "Bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" }
+          ).value
+
+          # 2. Present it to Entra as a client assertion. No secret involved -
+          #    the assertion IS the proof, and Entra verifies GitHub's signature.
+          $body = @{
+            client_id             = '${{ vars.AZURE_CLIENT_ID }}'
+            scope                 = 'https://graph.microsoft.com/.default'
+            client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'
+            client_assertion      = $ghToken
+            grant_type            = 'client_credentials'
+          }
+
+          $resp = Invoke-RestMethod -Method POST `
+              -Uri "https://login.microsoftonline.com/${{ vars.AZURE_TENANT_ID }}/oauth2/v2.0/token" `
+              -Body $body
+
+          # Mask it so it can never appear in a log, even on failure.
+          Write-Host "::add-mask::$($resp.access_token)"
+          "graph_token=$($resp.access_token)" >> $env:GITHUB_OUTPUT
+
+      - name: Install Graph SDK
+        shell: pwsh
+        run: Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Applications -Force -Scope CurrentUser
+
+      - name: Run the scan
+        shell: pwsh
+        env:
+          GRAPH_TOKEN: ${{ steps.token.outputs.graph_token }}
+        run: |
+          # VERIFY THIS AGAINST YOUR SDK VERSION. -AccessToken changed to expect a
+          # SecureString in Graph SDK v2. If yours wants a plain string, drop the conversion.
+          $secure = ConvertTo-SecureString $env:GRAPH_TOKEN -AsPlainText -Force
+          Connect-MgGraph -AccessToken $secure -NoWelcome
+
+          ./scripts/01-Get-NHIInventory.ps1
+          ./scripts/03-New-OwnershipMap.ps1
+          ./scripts/05-New-ControlReport.ps1
+
+      - name: Fail on Critical findings
+        shell: pwsh
+        run: |
+          $findings = Get-Content ./output/nhi_findings.json -Raw | ConvertFrom-Json
+          $critical = @($findings.Findings | Where-Object { $_.TopSeverity -eq 'Critical' })
+
+          if ($critical.Count -gt 0) {
+            Write-Host "::error::$($critical.Count) Critical finding(s)"
+            foreach ($c in $critical) { Write-Host "::error::  $($c.DisplayName)" }
+            exit 1
+          }
+          Write-Host "No Critical findings."
